@@ -1,6 +1,8 @@
-# Laravel Server Setup — DigitalOcean + Ubuntu 24.04
+# Laravel API Server Setup — DigitalOcean + Ubuntu 24.04
 
-One-script setup for deploying a Laravel on a fresh DigitalOcean droplet. Installs and configures Nginx, PHP, MySQL, Composer, Supervisor, and UFW — then clones your project, sets up `.env`, runs migrations, and gets your APP live.
+One-script setup for deploying a Laravel API on a fresh DigitalOcean droplet. Installs and configures Nginx, PHP, MySQL, Composer, Supervisor, and UFW — then clones your project, sets up `.env`, runs migrations, and gets your API live.
+
+The script creates a dedicated `deploy` user for application tasks (git, composer, artisan) so nothing runs as root unnecessarily.
 
 ---
 
@@ -35,27 +37,33 @@ ssh root@YOUR_DROPLET_IP
 
 ---
 
-## Step 3: Generate an SSH Key (for GitHub)
+## Step 3: Create the Deploy User & SSH Key (for GitHub)
 
-Your droplet needs an SSH key to clone private repos from GitHub.
+The script will create a `deploy` user automatically, but the SSH key for GitHub needs to be set up **before** running the script so it can clone your repo.
 
-**3a. Generate the key:**
+**3a. Create the deploy user:**
 
 ```bash
-ssh-keygen -t ed25519 -C "your-email@example.com"
+adduser --disabled-password --gecos "" deploy
+```
+
+**3b. Generate an SSH key for the deploy user:**
+
+```bash
+sudo -u deploy ssh-keygen -t ed25519 -C "your-email@example.com"
 ```
 
 Press **Enter** through all prompts (default path, no passphrase).
 
-**3b. Copy the public key:**
+**3c. Copy the public key:**
 
 ```bash
-cat ~/.ssh/id_ed25519.pub
+cat /home/deploy/.ssh/id_ed25519.pub
 ```
 
 Copy the entire output (starts with `ssh-ed25519`).
 
-**3c. Add it to GitHub:**
+**3d. Add it to GitHub:**
 
 1. Go to [github.com/settings/keys](https://github.com/settings/keys)
 2. Click **New SSH key**
@@ -63,10 +71,10 @@ Copy the entire output (starts with `ssh-ed25519`).
 4. **Key**: paste the public key
 5. Click **Add SSH key**
 
-**3d. Test the connection:**
+**3e. Test the connection:**
 
 ```bash
-ssh -T git@github.com
+sudo -u deploy ssh -T git@github.com
 ```
 
 You should see: `Hi <username>! You've successfully authenticated...`
@@ -102,6 +110,7 @@ DB_NAME="your_db"                      # MySQL database name
 DB_USER="your_user"                    # MySQL username
 DB_PASS="your_strong_password"         # MySQL password
 PHP_VERSION="8.4"                      # PHP version
+DEPLOY_USER="deploy"                   # Non-root user (default is fine)
 GIT_REPO=""                            # Repo URL — leave empty to enter during setup
 ```
 
@@ -120,17 +129,18 @@ The script will:
 
 1. Update system packages
 2. Install Git, Supervisor, utilities
-3. Clone your Laravel project
-4. Install PHP + all required extensions
-5. Install Composer + run `composer install`
-6. Install MySQL + create database & user
-7. Configure `.env` (app key, DB credentials, production mode)
-8. Run migrations
-9. Configure Nginx with security headers, gzip, proper routing
-10. Set up UFW firewall (SSH, HTTP, HTTPS only)
-11. Configure Supervisor queue workers
-12. Install Node.js 24 LTS
-13. Create a `deploy-laravel` helper command
+3. Create `deploy` user (skips if already created in Step 3)
+4. Clone your Laravel project as the deploy user
+5. Install PHP + all required extensions
+6. Install Composer + run `composer install` as the deploy user
+7. Install MySQL + create database & user
+8. Configure `.env` (app key, DB credentials, production mode)
+9. Run migrations as the deploy user
+10. Configure Nginx with security headers, gzip, proper routing
+11. Set up UFW firewall (SSH, HTTP, HTTPS only)
+12. Configure Supervisor queue workers (run as deploy user)
+13. Install Node.js 24 LTS
+14. Create a `deploy-laravel` helper command
 
 ---
 
@@ -149,15 +159,29 @@ Certbot will auto-renew via a systemd timer.
 
 ## After Setup
 
+### User roles
+
+| User | Used for |
+|------|----------|
+| `root` | System admin — installing packages, Nginx config, firewall, SSL, running `deploy-laravel` |
+| `deploy` | App tasks — git pull, composer, artisan, owns all app files |
+
+You can SSH in as either user:
+
+```bash
+ssh root@YOUR_IP        # system admin
+ssh deploy@YOUR_IP      # app tasks
+```
+
 ### Deploying updates
 
-After pushing code to GitHub, just run:
+After pushing code to GitHub, run as root:
 
 ```bash
 deploy-laravel
 ```
 
-This pulls the latest code, installs dependencies, runs migrations, rebuilds caches, and restarts workers + PHP-FPM.
+This pulls the latest code, installs dependencies, runs migrations, rebuilds caches, and restarts workers + PHP-FPM — all app commands run as the `deploy` user automatically.
 
 ### Editing environment variables
 
@@ -168,7 +192,7 @@ nano /var/www/your-app/.env
 After editing, rebuild the config cache:
 
 ```bash
-cd /var/www/your-app && php artisan config:cache
+cd /var/www/your-app && sudo -u deploy php artisan config:cache
 ```
 
 ### Checking logs
@@ -202,9 +226,9 @@ supervisorctl restart laravel-worker:*
 | **Web Server**| Nginx (gzip, security headers, Laravel routing) |
 | **PHP**       | 8.4 FPM + OPcache, mysql, redis, gd, intl, etc. |
 | **Database**  | MySQL 8 (utf8mb4)                            |
-| **Composer**  | Latest                                       |
+| **Composer**  | Latest (runs as `deploy` user)               |
 | **Node.js**   | 24 LTS                                       |
-| **Queue**     | Supervisor (2 workers, auto-restart)         |
+| **Queue**     | Supervisor (2 workers, auto-restart, runs as `deploy`) |
 | **Firewall**  | UFW (SSH + HTTP + HTTPS only)                |
 
 ---
@@ -220,7 +244,7 @@ ls /var/run/php/php8.4-fpm.sock
 
 **Permission denied on storage/** — fix ownership:
 ```bash
-chown -R www-data:www-data /var/www/your-app/storage /var/www/your-app/bootstrap/cache
+chown -R deploy:www-data /var/www/your-app/storage /var/www/your-app/bootstrap/cache
 chmod -R 775 /var/www/your-app/storage /var/www/your-app/bootstrap/cache
 ```
 

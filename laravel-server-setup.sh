@@ -4,9 +4,9 @@
 # =============================================================================
 #
 # BEFORE RUNNING:
-#   1. Create an SSH key and add it to GitHub (see README.md — Step 3)
+#   1. Generate an SSH key for the deploy user (see README.md — Step 3)
 #   2. Edit the CONFIGURATION section below with your values
-#   3. Run:
+#   3. Run as root:
 #        chmod +x laravel-server-setup.sh
 #        ./laravel-server-setup.sh
 #
@@ -23,6 +23,7 @@ DB_NAME="laravel"                      # MySQL database name
 DB_USER="laravel_user"                 # MySQL username
 DB_PASS="CHANGE_ME_STRONG_PASSWORD"    # MySQL password - CHANGE THIS!
 PHP_VERSION="8.4"                      # PHP version (8.3, 8.4, etc.)
+DEPLOY_USER="deploy"                   # Non-root user for app tasks
 GIT_REPO=""                            # Git SSH URL (leave empty to enter during setup)
                                        # Format: git@github.com:username/repo.git
 
@@ -32,8 +33,13 @@ echo "  Ubuntu 24.04 LTS | DigitalOcean"
 echo "============================================"
 
 # ---------------------------
-# Preflight check
+# Preflight checks
 # ---------------------------
+if [ "$EUID" -ne 0 ]; then
+    echo "  ERROR: This script must be run as root."
+    exit 1
+fi
+
 if [ "$DB_PASS" = "CHANGE_ME_STRONG_PASSWORD" ]; then
     echo ""
     echo "  ERROR: You must change DB_PASS before running this script."
@@ -46,21 +52,55 @@ fi
 # STEP 1: System Update
 # ---------------------------
 echo ""
-echo "[1/11] Updating system packages..."
+echo "[1/12] Updating system packages..."
 apt update && apt upgrade -y
 
 # ---------------------------
 # STEP 2: Install Git & Utilities
 # ---------------------------
 echo ""
-echo "[2/11] Installing Git, Supervisor, and utilities..."
+echo "[2/12] Installing Git, Supervisor, and utilities..."
 apt install -y git unzip supervisor acl
 
 # ---------------------------
-# STEP 3: Clone Laravel Project
+# STEP 3: Create Deploy User
 # ---------------------------
 echo ""
-echo "[3/11] Cloning Laravel project..."
+echo "[3/12] Creating deploy user..."
+
+if id "${DEPLOY_USER}" &>/dev/null; then
+    echo "  -> User '${DEPLOY_USER}' already exists, skipping"
+else
+    adduser --disabled-password --gecos "" ${DEPLOY_USER}
+    # Add to www-data group so Nginx can read files
+    usermod -aG www-data ${DEPLOY_USER}
+    echo "  -> User '${DEPLOY_USER}' created"
+fi
+
+# Copy root's SSH key to deploy user so they can SSH in too
+if [ -f /root/.ssh/authorized_keys ]; then
+    mkdir -p /home/${DEPLOY_USER}/.ssh
+    cp /root/.ssh/authorized_keys /home/${DEPLOY_USER}/.ssh/
+    chown -R ${DEPLOY_USER}:${DEPLOY_USER} /home/${DEPLOY_USER}/.ssh
+    chmod 700 /home/${DEPLOY_USER}/.ssh
+    chmod 600 /home/${DEPLOY_USER}/.ssh/authorized_keys
+    echo "  -> SSH keys copied (you can now ssh ${DEPLOY_USER}@your-ip)"
+fi
+
+# Allow deploy user to restart services without password
+cat > /etc/sudoers.d/${DEPLOY_USER} <<SUDOERS
+${DEPLOY_USER} ALL=(ALL) NOPASSWD: /usr/sbin/service php${PHP_VERSION}-fpm restart
+${DEPLOY_USER} ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl restart laravel-worker\:*
+${DEPLOY_USER} ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl reread
+${DEPLOY_USER} ALL=(ALL) NOPASSWD: /usr/bin/supervisorctl update
+SUDOERS
+chmod 440 /etc/sudoers.d/${DEPLOY_USER}
+
+# ---------------------------
+# STEP 4: Clone Laravel Project
+# ---------------------------
+echo ""
+echo "[4/12] Cloning Laravel project..."
 
 if [ -z "$GIT_REPO" ]; then
     echo ""
@@ -76,32 +116,35 @@ if [ -z "$GIT_REPO" ]; then
 fi
 
 mkdir -p $(dirname ${APP_DIR})
-git clone ${GIT_REPO} ${APP_DIR}
+
+# Clone as deploy user (uses deploy user's SSH key for GitHub)
+sudo -u ${DEPLOY_USER} git clone ${GIT_REPO} ${APP_DIR}
+
 echo "  -> Project cloned to ${APP_DIR}"
 
 # ---------------------------
-# STEP 4: Add PHP Repository
+# STEP 5: Add PHP Repository
 # ---------------------------
 echo ""
-echo "[4/11] Adding PHP repository..."
+echo "[5/12] Adding PHP repository..."
 apt install -y software-properties-common
 add-apt-repository -y ppa:ondrej/php
 apt update
 
 # ---------------------------
-# STEP 5: Install Nginx
+# STEP 6: Install Nginx
 # ---------------------------
 echo ""
-echo "[5/11] Installing Nginx..."
+echo "[6/12] Installing Nginx..."
 apt install -y nginx
 systemctl enable nginx
 systemctl start nginx
 
 # ---------------------------
-# STEP 6: Install PHP + Extensions
+# STEP 7: Install PHP + Extensions
 # ---------------------------
 echo ""
-echo "[6/11] Installing PHP ${PHP_VERSION} and extensions..."
+echo "[7/12] Installing PHP ${PHP_VERSION} and extensions..."
 apt install -y \
     php${PHP_VERSION}-fpm \
     php${PHP_VERSION}-cli \
@@ -139,20 +182,20 @@ EOF
 systemctl restart php${PHP_VERSION}-fpm
 
 # ---------------------------
-# STEP 7: Install Composer + Dependencies
+# STEP 8: Install Composer + Dependencies
 # ---------------------------
 echo ""
-echo "[7/11] Installing Composer and project dependencies..."
+echo "[8/12] Installing Composer and project dependencies..."
 curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
 
 cd ${APP_DIR}
-composer install --no-dev --optimize-autoloader
+sudo -u ${DEPLOY_USER} composer install --no-dev --optimize-autoloader
 
 # ---------------------------
-# STEP 8: Install MySQL + Setup Database
+# STEP 9: Install MySQL + Setup Database
 # ---------------------------
 echo ""
-echo "[8/11] Installing MySQL 8..."
+echo "[9/12] Installing MySQL 8..."
 apt install -y mysql-server
 
 mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${DB_PASS}';"
@@ -167,16 +210,16 @@ echo "  -> Database '${DB_NAME}' created"
 echo "  -> User '${DB_USER}' created with privileges"
 
 # ---------------------------
-# STEP 9: Configure Laravel
+# STEP 10: Configure Laravel
 # ---------------------------
 echo ""
-echo "[9/11] Configuring Laravel..."
+echo "[10/12] Configuring Laravel..."
 
 cd ${APP_DIR}
 
 if [ ! -f .env ]; then
-    cp .env.example .env
-    php artisan key:generate
+    sudo -u ${DEPLOY_USER} cp .env.example .env
+    sudo -u ${DEPLOY_USER} php artisan key:generate
 
     sed -i "s/DB_DATABASE=.*/DB_DATABASE=${DB_NAME}/" .env
     sed -i "s/DB_USERNAME=.*/DB_USERNAME=${DB_USER}/" .env
@@ -191,23 +234,26 @@ else
     echo "  -> .env already exists, skipping"
 fi
 
-php artisan migrate --force
+# Run migrations as deploy user
+sudo -u ${DEPLOY_USER} php artisan migrate --force
 echo "  -> Migrations complete"
 
-chown -R www-data:www-data storage bootstrap/cache
-chmod -R 775 storage bootstrap/cache
+# Set ownership: deploy user owns files, www-data group for Nginx
+chown -R ${DEPLOY_USER}:www-data ${APP_DIR}
+chmod -R 775 ${APP_DIR}/storage ${APP_DIR}/bootstrap/cache
 
-php artisan config:cache
-php artisan route:cache
-php artisan view:cache
-php artisan event:cache
+# Build caches as deploy user
+sudo -u ${DEPLOY_USER} php artisan config:cache
+sudo -u ${DEPLOY_USER} php artisan route:cache
+sudo -u ${DEPLOY_USER} php artisan view:cache
+sudo -u ${DEPLOY_USER} php artisan event:cache
 echo "  -> Caches built"
 
 # ---------------------------
-# STEP 10: Configure Nginx
+# STEP 11: Configure Nginx
 # ---------------------------
 echo ""
-echo "[10/11] Configuring Nginx..."
+echo "[11/12] Configuring Nginx..."
 
 rm -f /etc/nginx/sites-enabled/default
 
@@ -283,10 +329,10 @@ nginx -t
 systemctl reload nginx
 
 # ---------------------------
-# STEP 11: Firewall + Supervisor
+# STEP 12: Firewall + Supervisor
 # ---------------------------
 echo ""
-echo "[11/11] Configuring firewall and queue workers..."
+echo "[12/12] Configuring firewall and queue workers..."
 
 ufw allow OpenSSH
 ufw allow 'Nginx Full'
@@ -300,7 +346,7 @@ autostart=true
 autorestart=true
 stopasgroup=true
 killasgroup=true
-user=www-data
+user=${DEPLOY_USER}
 numprocs=2
 redirect_stderr=true
 stdout_logfile=${APP_DIR}/storage/logs/worker.log
@@ -321,46 +367,45 @@ apt install -y nodejs
 # ---------------------------
 # Create deployment helper
 # ---------------------------
-cat > /usr/local/bin/deploy-laravel <<'DEPLOY'
+cat > /usr/local/bin/deploy-laravel <<DEPLOY
 #!/bin/bash
 set -e
 
-APP_DIR="APP_DIR_REPLACE"
-PHP_VERSION="PHP_VERSION_REPLACE"
+APP_DIR="${APP_DIR}"
+PHP_VERSION="${PHP_VERSION}"
+DEPLOY_USER="${DEPLOY_USER}"
 
-cd $APP_DIR
+cd \$APP_DIR
 
 echo "-> Pulling latest code..."
-git pull origin main
+sudo -u \$DEPLOY_USER git pull origin main
 
 echo "-> Installing dependencies..."
-composer install --no-dev --optimize-autoloader
+sudo -u \$DEPLOY_USER composer install --no-dev --optimize-autoloader
 
 echo "-> Running migrations..."
-php artisan migrate --force
+sudo -u \$DEPLOY_USER php artisan migrate --force
 
 echo "-> Clearing and rebuilding caches..."
-php artisan config:cache
-php artisan route:cache
-php artisan view:cache
-php artisan event:cache
+sudo -u \$DEPLOY_USER php artisan config:cache
+sudo -u \$DEPLOY_USER php artisan route:cache
+sudo -u \$DEPLOY_USER php artisan view:cache
+sudo -u \$DEPLOY_USER php artisan event:cache
 
 echo "-> Restarting queue workers..."
-php artisan queue:restart
+sudo -u \$DEPLOY_USER php artisan queue:restart
 
 echo "-> Setting permissions..."
-chown -R www-data:www-data storage bootstrap/cache
+chown -R \$DEPLOY_USER:www-data storage bootstrap/cache
 chmod -R 775 storage bootstrap/cache
 
 echo "-> Restarting PHP-FPM..."
-systemctl restart php${PHP_VERSION}-fpm
+systemctl restart php\${PHP_VERSION}-fpm
 
 echo ""
 echo "Deployment complete!"
 DEPLOY
 
-sed -i "s|APP_DIR_REPLACE|${APP_DIR}|g" /usr/local/bin/deploy-laravel
-sed -i "s|PHP_VERSION_REPLACE|${PHP_VERSION}|g" /usr/local/bin/deploy-laravel
 chmod +x /usr/local/bin/deploy-laravel
 
 # ---------------------------
@@ -371,19 +416,24 @@ echo "============================================"
 echo "  SETUP COMPLETE! Your API is live."
 echo "============================================"
 echo ""
-echo "  App URL:       http://${APP_DOMAIN}"
+echo "  App URL:        http://${APP_DOMAIN}"
 echo "  App directory:  ${APP_DIR}"
+echo "  Deploy user:    ${DEPLOY_USER}"
 echo ""
 echo "  Database:"
 echo "     Name: ${DB_NAME}"
 echo "     User: ${DB_USER}"
 echo "     Pass: ${DB_PASS}"
 echo ""
+echo "  SSH access:"
+echo "     ssh ${DEPLOY_USER}@YOUR_IP  (for app tasks)"
+echo "     ssh root@YOUR_IP            (for system admin)"
+echo ""
 echo "  Next: Add SSL (HTTPS)"
 echo "     apt install certbot python3-certbot-nginx"
 echo "     certbot --nginx -d ${APP_DOMAIN}"
 echo ""
-echo "  Future deployments:"
+echo "  Future deployments (as root):"
 echo "     deploy-laravel"
 echo ""
 echo "============================================"
